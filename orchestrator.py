@@ -65,6 +65,10 @@ def run(story_path: str) -> None:
             logger.warning("Story changed since checkpoint — starting fresh")
             _checkpoint_clear(story_path)
             checkpoint = None
+        elif not all(k in checkpoint for k in ("phase_reached", "story_id")):
+            logger.warning("Incomplete checkpoint — starting fresh")
+            _checkpoint_clear(story_path)
+            checkpoint = None
         else:
             resume_phase = checkpoint["phase_reached"]
             story_id = checkpoint["story_id"]

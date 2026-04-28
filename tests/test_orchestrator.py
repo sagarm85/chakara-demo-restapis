@@ -1,4 +1,5 @@
 import sys
+import json
 import pytest
 from unittest.mock import MagicMock, patch
 import orchestrator
@@ -194,9 +195,6 @@ def test_main_block_with_story_arg_calls_run(tmp_path, mock_config, mock_tools):
             str(pathlib.Path(orchestrator.__file__).resolve()),
             run_name="__main__",
         )
-
-
-import json
 
 
 def _write_checkpoint(story_file, phase, story_text, story_id="CHAKRA-010",
