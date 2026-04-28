@@ -1,0 +1,149 @@
+import sys
+import pytest
+from unittest.mock import MagicMock, patch
+import orchestrator
+
+
+@pytest.fixture
+def mock_config():
+    from tools.config import Config, GitHubConfig, AnthropicConfig, GoogleConfig, TrackerConfig, StoryConfig
+    return Config(
+        github=GitHubConfig(repo="owner/repo", base_branch="main", ci_workflow="ci.yml"),
+        anthropic=AnthropicConfig(model="claude-opus-4-7"),
+        google=GoogleConfig(credentials_path="./credentials.json", spreadsheet_id="sid"),
+        tracker=TrackerConfig(sheet_name="Chakra Tracker"),
+        story=StoryConfig(id_prefix="CHAKRA"),
+    )
+
+
+@pytest.fixture
+def mock_tools():
+    github = MagicMock()
+    github.open_pr.return_value = ("https://github.com/owner/repo/pull/1", 1)
+    sheets = MagicMock()
+    sheets.get_all_story_ids.return_value = []
+    agent = MagicMock()
+    agent.plan.return_value = [{"task": "setup", "description": "do setup"}]
+    agent.code.return_value = {"src/app.py": "x = 1"}
+    agent.test.return_value = {"tests/test_app.py": "def test_x(): pass"}
+    agent.measure_coverage.return_value = (100.0, "TOTAL 1 0 100%")
+    return github, sheets, agent
+
+
+def _run_with_mocks(tmp_path, mock_config, github, sheets, agent, story_text="As a user I want X"):
+    story_file = tmp_path / "story.txt"
+    story_file.write_text(story_text)
+    with patch("orchestrator.load_config", return_value=mock_config), \
+         patch("orchestrator.setup_logging"), \
+         patch("orchestrator.GitHubTool", return_value=github), \
+         patch("orchestrator.SheetsTool", return_value=sheets), \
+         patch("orchestrator.SDLCAgent", return_value=agent), \
+         patch("orchestrator.prompt_approval", return_value=True), \
+         patch.dict("os.environ", {"GITHUB_TOKEN": "tok", "ANTHROPIC_API_KEY": "key"}):
+        orchestrator.run(str(story_file))
+
+
+def test_happy_path_calls_all_steps(tmp_path, mock_config, mock_tools):
+    github, sheets, agent = mock_tools
+    _run_with_mocks(tmp_path, mock_config, github, sheets, agent)
+    agent.plan.assert_called_once()
+    agent.code.assert_called_once()
+    agent.test.assert_called_once()
+    github.create_branch.assert_called_once()
+    github.commit_files.assert_called_once()
+    github.open_pr.assert_called_once()
+    github.poll_merge.assert_called_once()
+    github.trigger_cicd.assert_called_once()
+
+
+def test_sheets_status_sequence(tmp_path, mock_config, mock_tools):
+    github, sheets, agent = mock_tools
+    _run_with_mocks(tmp_path, mock_config, github, sheets, agent)
+    status_calls = [c[0][2] for c in sheets.update_status.call_args_list]
+    assert "Planning" in status_calls
+    assert "Coding" in status_calls
+    assert "Testing" in status_calls
+    assert "PR Created" in status_calls
+    assert "Done" in status_calls
+
+
+def test_planning_rejection_retries_with_feedback(tmp_path, mock_config, mock_tools):
+    from tools.approval_tool import ApprovalRejected
+    github, sheets, agent = mock_tools
+    story_file = tmp_path / "story.txt"
+    story_file.write_text("story")
+    approve_calls = [ApprovalRejected("too vague"), True]
+    with patch("orchestrator.load_config", return_value=mock_config), \
+         patch("orchestrator.setup_logging"), \
+         patch("orchestrator.GitHubTool", return_value=github), \
+         patch("orchestrator.SheetsTool", return_value=sheets), \
+         patch("orchestrator.SDLCAgent", return_value=agent), \
+         patch("orchestrator.prompt_approval", side_effect=approve_calls), \
+         patch.dict("os.environ", {"GITHUB_TOKEN": "tok", "ANTHROPIC_API_KEY": "key"}):
+        orchestrator.run(str(story_file))
+    assert agent.plan.call_count == 2
+    second_call_kwargs = agent.plan.call_args_list[1][1]
+    assert second_call_kwargs["rejection_feedback"] == "too vague"
+
+
+def test_planning_rejected_max_retries_exits(tmp_path, mock_config, mock_tools):
+    from tools.approval_tool import ApprovalRejected
+    github, sheets, agent = mock_tools
+    story_file = tmp_path / "story.txt"
+    story_file.write_text("story")
+    with patch("orchestrator.load_config", return_value=mock_config), \
+         patch("orchestrator.setup_logging"), \
+         patch("orchestrator.GitHubTool", return_value=github), \
+         patch("orchestrator.SheetsTool", return_value=sheets), \
+         patch("orchestrator.SDLCAgent", return_value=agent), \
+         patch("orchestrator.prompt_approval", side_effect=ApprovalRejected("bad")), \
+         patch.dict("os.environ", {"GITHUB_TOKEN": "tok", "ANTHROPIC_API_KEY": "key"}):
+        with pytest.raises(SystemExit) as exc_info:
+            orchestrator.run(str(story_file))
+    assert exc_info.value.code == 1
+
+
+def test_low_coverage_retries_test_generation(tmp_path, mock_config, mock_tools):
+    github, sheets, agent = mock_tools
+    agent.measure_coverage.side_effect = [
+        (50.0, "TOTAL 10 5 50%"),
+        (96.0, "TOTAL 10 0 96%"),
+    ]
+    _run_with_mocks(tmp_path, mock_config, github, sheets, agent)
+    assert agent.test.call_count == 2
+    second_call_kwargs = agent.test.call_args_list[1][1]
+    assert "50%" in second_call_kwargs["coverage_feedback"]
+
+
+def test_coverage_below_95_after_max_retries_exits(tmp_path, mock_config, mock_tools):
+    github, sheets, agent = mock_tools
+    agent.measure_coverage.return_value = (40.0, "TOTAL 10 6 40%")
+    story_file = tmp_path / "story.txt"
+    story_file.write_text("story")
+    with patch("orchestrator.load_config", return_value=mock_config), \
+         patch("orchestrator.setup_logging"), \
+         patch("orchestrator.GitHubTool", return_value=github), \
+         patch("orchestrator.SheetsTool", return_value=sheets), \
+         patch("orchestrator.SDLCAgent", return_value=agent), \
+         patch("orchestrator.prompt_approval", return_value=True), \
+         patch.dict("os.environ", {"GITHUB_TOKEN": "tok", "ANTHROPIC_API_KEY": "key"}):
+        with pytest.raises(SystemExit) as exc_info:
+            orchestrator.run(str(story_file))
+    assert exc_info.value.code == 1
+
+
+def test_branch_name_uses_story_id_and_title(tmp_path, mock_config, mock_tools):
+    github, sheets, agent = mock_tools
+    _run_with_mocks(tmp_path, mock_config, github, sheets, agent, "Add user login feature")
+    branch_arg = github.create_branch.call_args[0][0]
+    assert branch_arg.startswith("chakra/CHAKRA-")
+    assert "add-user-login" in branch_arg
+
+
+def test_missing_story_file_exits(tmp_path, mock_config, mock_tools):
+    github, sheets, agent = mock_tools
+    with patch("orchestrator.load_config", return_value=mock_config), \
+         patch("orchestrator.setup_logging"), \
+         patch.dict("os.environ", {"GITHUB_TOKEN": "tok", "ANTHROPIC_API_KEY": "key"}):
+        with pytest.raises((FileNotFoundError, SystemExit)):
+            orchestrator.run(str(tmp_path / "nonexistent.txt"))
