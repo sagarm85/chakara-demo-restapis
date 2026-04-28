@@ -90,3 +90,12 @@ def test_measure_coverage_returns_float_and_report(agent, tmp_path):
 def test_measure_coverage_returns_zero_on_no_tests(agent):
     coverage, report = agent.measure_coverage({"src/app.py": "x = 1"}, {})
     assert coverage == 0.0
+
+
+def test_extract_json_fallback_no_code_fence(agent):
+    """Cover the json.loads(text) fallback branch (line 34) when no ```json fence."""
+    raw_json = '[{"task": "t1", "description": "d1"}]'
+    agent._client.messages.create.return_value = _mock_response(raw_json)
+    result = agent.plan("story")
+    assert isinstance(result, list)
+    assert result[0]["task"] == "t1"

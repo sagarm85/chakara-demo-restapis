@@ -140,6 +140,17 @@ def test_branch_name_uses_story_id_and_title(tmp_path, mock_config, mock_tools):
     assert "add-user-login" in branch_arg
 
 
+def test_next_story_id_increments_from_existing(tmp_path, mock_config, mock_tools):
+    """Cover _next_story_id lines 25-27: loop body with matching IDs."""
+    github, sheets, agent = mock_tools
+    # Pre-populate existing IDs so the loop body with match/append is exercised
+    sheets.get_all_story_ids.return_value = ["CHAKRA-001", "CHAKRA-002", "OTHER-001"]
+    _run_with_mocks(tmp_path, mock_config, github, sheets, agent)
+    # Story should be CHAKRA-003 based on existing max of 2
+    upsert_call = sheets.upsert_row.call_args_list[0]
+    assert upsert_call[0][0] == "CHAKRA-003"
+
+
 def test_missing_story_file_exits(tmp_path, mock_config, mock_tools):
     github, sheets, agent = mock_tools
     with patch("orchestrator.load_config", return_value=mock_config), \
@@ -147,3 +158,38 @@ def test_missing_story_file_exits(tmp_path, mock_config, mock_tools):
          patch.dict("os.environ", {"GITHUB_TOKEN": "tok", "ANTHROPIC_API_KEY": "key"}):
         with pytest.raises((FileNotFoundError, SystemExit)):
             orchestrator.run(str(tmp_path / "nonexistent.txt"))
+
+
+def test_main_block_no_args_prints_usage(capsys):
+    """Cover the __main__ guard lines 119-121: no args → usage + SystemExit(1)."""
+    import runpy, pathlib
+    with patch.object(sys, "argv", ["orchestrator.py"]):
+        with pytest.raises(SystemExit) as exc_info:
+            runpy.run_path(
+                str(pathlib.Path(orchestrator.__file__).resolve()),
+                run_name="__main__",
+            )
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "Usage" in captured.out
+
+
+def test_main_block_with_story_arg_calls_run(tmp_path, mock_config, mock_tools):
+    """Cover orchestrator.py line 122: one arg → run() is called via __main__."""
+    import runpy, pathlib
+    github, sheets, agent = mock_tools
+    story_file = tmp_path / "story.txt"
+    story_file.write_text("story line")
+    # runpy creates a fresh namespace so we must patch the source modules directly
+    with patch.object(sys, "argv", ["orchestrator.py", str(story_file)]), \
+         patch("tools.config.load_config", return_value=mock_config), \
+         patch("tools.logger.setup_logging"), \
+         patch("tools.github_tool.GitHubTool", return_value=github), \
+         patch("tools.sheets_tool.SheetsTool", return_value=sheets), \
+         patch("agents.sdlc_agent.SDLCAgent", return_value=agent), \
+         patch("tools.approval_tool.prompt_approval", return_value=True), \
+         patch.dict("os.environ", {"GITHUB_TOKEN": "tok", "ANTHROPIC_API_KEY": "key"}):
+        runpy.run_path(
+            str(pathlib.Path(orchestrator.__file__).resolve()),
+            run_name="__main__",
+        )

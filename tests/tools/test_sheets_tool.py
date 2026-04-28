@@ -88,3 +88,23 @@ def test_get_all_story_ids_returns_ids(sheets_tool, mock_worksheet):
 def test_get_all_story_ids_empty_sheet(sheets_tool, mock_worksheet):
     mock_worksheet.get_all_records.return_value = []
     assert sheets_tool.get_all_story_ids() == []
+
+
+def test_get_or_create_sheet_creates_when_not_found():
+    """Cover the WorksheetNotFound branch in _get_or_create_sheet (lines 23-26)."""
+    import gspread as _gspread
+    new_ws = MagicMock()
+    with patch("tools.sheets_tool.gspread") as mock_gspread, \
+         patch("tools.sheets_tool.Credentials"):
+        mock_client = MagicMock()
+        mock_gspread.authorize.return_value = mock_client
+        mock_gspread.WorksheetNotFound = _gspread.WorksheetNotFound
+        mock_spreadsheet = MagicMock()
+        mock_client.open_by_key.return_value = mock_spreadsheet
+        # First call raises, second call (add_worksheet) returns new_ws
+        mock_spreadsheet.worksheet.side_effect = _gspread.WorksheetNotFound
+        mock_spreadsheet.add_worksheet.return_value = new_ws
+        tool = SheetsTool("./credentials.json", "sheet-id-abc", "New Sheet")
+    assert tool._sheet is new_ws
+    mock_spreadsheet.add_worksheet.assert_called_once_with("New Sheet", rows=1000, cols=5)
+    new_ws.append_row.assert_called_once()
