@@ -154,6 +154,28 @@ tail -f logs/chakra.log
 
 ---
 
+## Checkpoint & Resume
+
+Chakra saves a checkpoint file (`story.chakra.json`) next to your story file after each phase completes. If a run fails or is interrupted, the next run resumes from the last successful phase — no re-planning, no re-approval prompt.
+
+| Checkpoint `phase_reached` | What is skipped on next run |
+|---|---|
+| `planning` | Planning + human approval |
+| `coding` | Planning + coding |
+| `testing` | Planning + coding + testing |
+
+The checkpoint file is deleted automatically when the run completes successfully.
+
+**To force a fresh run** (re-plan from scratch):
+```bash
+rm story.chakra.json
+python3 orchestrator.py story.txt
+```
+
+If you edit `story.txt` between runs, Chakra detects the content change (via SHA-256 hash), discards the old checkpoint, and starts fresh automatically.
+
+---
+
 ## Security
 
 | File | Status |
@@ -180,6 +202,7 @@ chakra/
     ├── config.py            # config loader
     ├── logger.py            # logging setup
     ├── approval_tool.py     # terminal approval prompt
+    ├── checkpoint_tool.py   # phase checkpoint save/load/clear
     ├── github_tool.py       # GitHub branch / PR / CI
     └── sheets_tool.py       # Google Sheets tracker
 ```
