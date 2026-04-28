@@ -1,0 +1,17 @@
+github:
+  repo: "owner/repo-name"
+  base_branch: "main"
+  ci_workflow: "ci.yml"
+
+anthropic:
+  model: "claude-opus-4-7"
+
+google:
+  credentials_path: "./credentials.json"
+  spreadsheet_id: "your-sheet-id-here"
+
+tracker:
+  sheet_name: "Chakra Tracker"
+
+story:
+  id_prefix: "CHAKRA"
