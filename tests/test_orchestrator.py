@@ -2,6 +2,7 @@ import sys
 import pytest
 from unittest.mock import MagicMock, patch
 import orchestrator
+from tools.checkpoint_tool import story_hash as _story_hash
 
 
 @pytest.fixture
@@ -195,7 +196,6 @@ def test_main_block_with_story_arg_calls_run(tmp_path, mock_config, mock_tools):
         )
 
 
-import hashlib
 import json
 
 
@@ -203,7 +203,7 @@ def _write_checkpoint(story_file, phase, story_text, story_id="CHAKRA-010",
                       tasks=None, code_files=None, test_files=None):
     data = {
         "story_id": story_id,
-        "story_hash": hashlib.sha256(story_text.encode()).hexdigest(),
+        "story_hash": _story_hash(story_text),
         "phase_reached": phase,
         "tasks": tasks or [{"task": "setup", "description": "do setup"}],
     }
