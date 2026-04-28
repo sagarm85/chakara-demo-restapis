@@ -28,10 +28,20 @@ class SDLCAgent:
         return result
 
     def _extract_json(self, text: str):
-        match = re.search(r"```json\n(.*?)\n```", text, re.DOTALL)
+        # Try fenced code block (handles varied whitespace and case)
+        match = re.search(r"```(?:json)?\s*\n(.*?)\n\s*```", text, re.DOTALL | re.IGNORECASE)
         if match:
-            return json.loads(match.group(1))
-        return json.loads(text)
+            return json.loads(match.group(1).strip())
+        # Fall back to first JSON array or object in the text
+        for opener, closer in [("[", "]"), ("{", "}")]:
+            start = text.find(opener)
+            end = text.rfind(closer)
+            if start != -1 and end > start:
+                try:
+                    return json.loads(text[start : end + 1])
+                except json.JSONDecodeError:
+                    continue
+        raise ValueError(f"No JSON found in response: {text[:200]!r}")
 
     def plan(self, story: str, rejection_feedback: str = "") -> list[dict]:
         feedback_section = (
