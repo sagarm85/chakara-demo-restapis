@@ -1,7 +1,9 @@
 import sys
+import json
 import pytest
 from unittest.mock import MagicMock, patch
 import orchestrator
+from tools.checkpoint_tool import story_hash as _story_hash
 
 
 @pytest.fixture
@@ -193,3 +195,103 @@ def test_main_block_with_story_arg_calls_run(tmp_path, mock_config, mock_tools):
             str(pathlib.Path(orchestrator.__file__).resolve()),
             run_name="__main__",
         )
+
+
+def _write_checkpoint(story_file, phase, story_text, story_id="CHAKRA-010",
+                      tasks=None, code_files=None, test_files=None):
+    data = {
+        "story_id": story_id,
+        "story_hash": _story_hash(story_text),
+        "phase_reached": phase,
+        "tasks": tasks or [{"task": "setup", "description": "do setup"}],
+    }
+    if code_files is not None:
+        data["code_files"] = code_files
+    if test_files is not None:
+        data["test_files"] = test_files
+    story_file.with_suffix(".chakra.json").write_text(json.dumps(data))
+
+
+def _run_resuming(tmp_path, mock_config, github, sheets, agent, story_text="As a user I want X"):
+    story_file = tmp_path / "story.txt"
+    story_file.write_text(story_text)
+    with patch("orchestrator.load_config", return_value=mock_config), \
+         patch("orchestrator.setup_logging"), \
+         patch("orchestrator.GitHubTool", return_value=github), \
+         patch("orchestrator.SheetsTool", return_value=sheets), \
+         patch("orchestrator.SDLCAgent", return_value=agent), \
+         patch("orchestrator.prompt_approval", return_value=True), \
+         patch.dict("os.environ", {"GITHUB_TOKEN": "tok", "ANTHROPIC_API_KEY": "key"}):
+        orchestrator.run(str(story_file))
+    return story_file
+
+
+def test_fresh_run_clears_checkpoint_on_done(tmp_path, mock_config, mock_tools):
+    github, sheets, agent = mock_tools
+    story_file = _run_resuming(tmp_path, mock_config, github, sheets, agent)
+    assert not story_file.with_suffix(".chakra.json").exists()
+
+
+def test_resume_from_planning_skips_plan(tmp_path, mock_config, mock_tools):
+    github, sheets, agent = mock_tools
+    story_text = "As a user I want X"
+    story_file = tmp_path / "story.txt"
+    story_file.write_text(story_text)
+    _write_checkpoint(story_file, "planning", story_text)
+    _run_resuming(tmp_path, mock_config, github, sheets, agent, story_text)
+    agent.plan.assert_not_called()
+    agent.code.assert_called_once()
+    agent.test.assert_called_once()
+
+
+def test_resume_from_coding_skips_plan_and_code(tmp_path, mock_config, mock_tools):
+    github, sheets, agent = mock_tools
+    story_text = "As a user I want X"
+    story_file = tmp_path / "story.txt"
+    story_file.write_text(story_text)
+    _write_checkpoint(story_file, "coding", story_text,
+                      code_files={"src/app.py": "x = 1"})
+    _run_resuming(tmp_path, mock_config, github, sheets, agent, story_text)
+    agent.plan.assert_not_called()
+    agent.code.assert_not_called()
+    agent.test.assert_called_once()
+
+
+def test_resume_from_testing_skips_all_agent_calls(tmp_path, mock_config, mock_tools):
+    github, sheets, agent = mock_tools
+    story_text = "As a user I want X"
+    story_file = tmp_path / "story.txt"
+    story_file.write_text(story_text)
+    _write_checkpoint(story_file, "testing", story_text,
+                      code_files={"src/app.py": "x = 1"},
+                      test_files={"tests/test_app.py": "def test_x(): pass"})
+    _run_resuming(tmp_path, mock_config, github, sheets, agent, story_text)
+    agent.plan.assert_not_called()
+    agent.code.assert_not_called()
+    agent.test.assert_not_called()
+    github.create_branch.assert_called_once()
+
+
+def test_stale_checkpoint_discarded_on_story_change(tmp_path, mock_config, mock_tools):
+    github, sheets, agent = mock_tools
+    story_text = "As a user I want X"
+    story_file = tmp_path / "story.txt"
+    story_file.write_text(story_text)
+    story_file.with_suffix(".chakra.json").write_text(json.dumps({
+        "story_id": "CHAKRA-010",
+        "story_hash": "stale_hash_from_different_story",
+        "phase_reached": "planning",
+        "tasks": [{"task": "old", "description": "old"}],
+    }))
+    _run_resuming(tmp_path, mock_config, github, sheets, agent, story_text)
+    agent.plan.assert_called_once()
+
+
+def test_corrupt_checkpoint_treated_as_fresh_start(tmp_path, mock_config, mock_tools):
+    github, sheets, agent = mock_tools
+    story_text = "As a user I want X"
+    story_file = tmp_path / "story.txt"
+    story_file.write_text(story_text)
+    story_file.with_suffix(".chakra.json").write_text("not valid json {{{{")
+    _run_resuming(tmp_path, mock_config, github, sheets, agent, story_text)
+    agent.plan.assert_called_once()

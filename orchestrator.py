@@ -6,6 +6,12 @@ from pathlib import Path
 
 from agents.sdlc_agent import SDLCAgent
 from tools.approval_tool import ApprovalRejected, prompt_approval
+from tools.checkpoint_tool import (
+    clear as _checkpoint_clear,
+    load as _checkpoint_load,
+    save as _checkpoint_save,
+    story_hash as _story_hash,
+)
 from tools.config import load_config
 from tools.github_tool import GitHubTool
 from tools.logger import setup_logging
@@ -45,51 +51,103 @@ def run(story_path: str) -> None:
     )
     agent = SDLCAgent(os.environ["ANTHROPIC_API_KEY"], config.anthropic.model)
 
-    story_id = _next_story_id(config.story.id_prefix, sheets)
-    logger.info("Starting SDLC loop: %s — %s", story_id, story_title)
+    # Checkpoint / resume
+    current_hash = _story_hash(story)
+    checkpoint = _checkpoint_load(story_path)
+    resume_phase = None
+    tasks: list[dict] = []
+    code_files: dict[str, str] = {}
+    test_files: dict[str, str] = {}
+    plan_text = ""
+
+    if checkpoint:
+        if checkpoint.get("story_hash") != current_hash:
+            logger.warning("Story changed since checkpoint — starting fresh")
+            _checkpoint_clear(story_path)
+            checkpoint = None
+        elif not all(k in checkpoint for k in ("phase_reached", "story_id")):
+            logger.warning("Incomplete checkpoint — starting fresh")
+            _checkpoint_clear(story_path)
+            checkpoint = None
+        else:
+            resume_phase = checkpoint["phase_reached"]
+            story_id = checkpoint["story_id"]
+            tasks = checkpoint.get("tasks", [])
+            code_files = checkpoint.get("code_files", {})
+            test_files = checkpoint.get("test_files", {})
+            plan_text = "\n".join(
+                f"  {i + 1}. {t['task']}: {t['description']}" for i, t in enumerate(tasks)
+            )
+            logger.info("Resuming %s from phase: %s", story_id, resume_phase)
+            print(f"Resuming {story_id} from {resume_phase} phase.")
+
+    if not checkpoint:
+        story_id = _next_story_id(config.story.id_prefix, sheets)
+        logger.info("Starting SDLC loop: %s — %s", story_id, story_title)
 
     sheets.upsert_row(story_id, story_title, "overall", "Pending")
 
-    # Planning phase with approval loop
-    sheets.update_status(story_id, "overall", "Planning")
-    rejection_feedback = ""
-    tasks = []
-    plan_text = ""
-    for attempt in range(MAX_RETRIES):
-        tasks = agent.plan(story, rejection_feedback=rejection_feedback)
-        plan_text = "\n".join(
-            f"  {i + 1}. {t['task']}: {t['description']}" for i, t in enumerate(tasks)
-        )
-        try:
-            prompt_approval(f"Planning — {story_id}", plan_text)
-            logger.info("Plan approved on attempt %d", attempt + 1)
-            break
-        except ApprovalRejected as e:
-            rejection_feedback = e.reason
-            logger.warning("Plan rejected (attempt %d/%d): %s", attempt + 1, MAX_RETRIES, e.reason)
-            if attempt == MAX_RETRIES - 1:
-                logger.error("Planning rejected %d times, aborting", MAX_RETRIES)
-                sys.exit(1)
+    # Planning phase
+    if resume_phase not in {"planning", "coding", "testing"}:
+        sheets.update_status(story_id, "overall", "Planning")
+        rejection_feedback = ""
+        for attempt in range(MAX_RETRIES):
+            tasks = agent.plan(story, rejection_feedback=rejection_feedback)
+            plan_text = "\n".join(
+                f"  {i + 1}. {t['task']}: {t['description']}" for i, t in enumerate(tasks)
+            )
+            try:
+                prompt_approval(f"Planning — {story_id}", plan_text)
+                logger.info("Plan approved on attempt %d", attempt + 1)
+                break
+            except ApprovalRejected as e:
+                rejection_feedback = e.reason
+                logger.warning("Plan rejected (attempt %d/%d): %s", attempt + 1, MAX_RETRIES, e.reason)
+                if attempt == MAX_RETRIES - 1:
+                    logger.error("Planning rejected %d times, aborting", MAX_RETRIES)
+                    sys.exit(1)
+        _checkpoint_save(story_path, {
+            "story_id": story_id,
+            "story_hash": current_hash,
+            "phase_reached": "planning",
+            "tasks": tasks,
+        })
 
     # Coding phase
-    sheets.update_status(story_id, "overall", "Coding")
-    logger.info("Generating code for %d tasks", len(tasks))
-    code_files = agent.code(story, tasks)
+    if resume_phase not in {"coding", "testing"}:
+        sheets.update_status(story_id, "overall", "Coding")
+        logger.info("Generating code for %d tasks", len(tasks))
+        code_files = agent.code(story, tasks)
+        _checkpoint_save(story_path, {
+            "story_id": story_id,
+            "story_hash": current_hash,
+            "phase_reached": "coding",
+            "tasks": tasks,
+            "code_files": code_files,
+        })
 
-    # Testing phase with coverage enforcement
-    sheets.update_status(story_id, "overall", "Testing")
-    coverage_feedback = ""
-    test_files: dict[str, str] = {}
-    for attempt in range(MAX_RETRIES):
-        test_files = agent.test(story, code_files, coverage_feedback=coverage_feedback)
-        coverage, report = agent.measure_coverage(code_files, test_files)
-        logger.info("Coverage attempt %d/%d: %.0f%%", attempt + 1, MAX_RETRIES, coverage)
-        if coverage >= 95.0:
-            break
-        coverage_feedback = report
-        if attempt == MAX_RETRIES - 1:
-            logger.error("Coverage %.0f%% below 95%% after %d retries, aborting", coverage, MAX_RETRIES)
-            sys.exit(1)
+    # Testing phase
+    if resume_phase != "testing":
+        sheets.update_status(story_id, "overall", "Testing")
+        coverage_feedback = ""
+        for attempt in range(MAX_RETRIES):
+            test_files = agent.test(story, code_files, coverage_feedback=coverage_feedback)
+            coverage, report = agent.measure_coverage(code_files, test_files)
+            logger.info("Coverage attempt %d/%d: %.0f%%", attempt + 1, MAX_RETRIES, coverage)
+            if coverage >= 95.0:
+                break
+            coverage_feedback = report
+            if attempt == MAX_RETRIES - 1:
+                logger.error("Coverage %.0f%% below 95%% after %d retries, aborting", coverage, MAX_RETRIES)
+                sys.exit(1)
+        _checkpoint_save(story_path, {
+            "story_id": story_id,
+            "story_hash": current_hash,
+            "phase_reached": "testing",
+            "tasks": tasks,
+            "code_files": code_files,
+            "test_files": test_files,
+        })
 
     # GitHub: branch, commit, PR
     branch_name = f"chakra/{story_id}-{_slugify(story_title)}"
@@ -111,6 +169,7 @@ def run(story_path: str) -> None:
     github.poll_merge(pr_number)
     github.trigger_cicd(config.github.ci_workflow, config.github.base_branch)
     sheets.update_status(story_id, "overall", "Done")
+    _checkpoint_clear(story_path)
     logger.info("SDLC loop complete: %s", story_id)
     print(f"\nDone! {story_id} complete.")
 
